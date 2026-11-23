@@ -1,4 +1,4 @@
-import "dotenv/config";
+/*import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -166,4 +166,11 @@ app.use((err,_req,res,_next) => {
 });
 
 const port = Number(process.env.PORT || 5000);
-app.listen(port, () => console.log(`WMS API running at http://localhost:${port}`));
+app.listen(port, () => console.log(`WMS API running at http://localhost:${port}`)); */
+
+app.get("/api/health", (_req, res) =>
+  res.json({
+    status: "ok",
+    service: "CEVA WMS Simulator API"
+  })
+);
