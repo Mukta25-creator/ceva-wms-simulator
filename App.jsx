@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { Routes, Route, Navigate, NavLink, useNavigate } from "react-router-dom";
 import { LayoutDashboard, Warehouse, Package, MapPin, Boxes, ClipboardList, Users, LogOut, Menu, Search, Plus, RefreshCw, X, Truck, ShieldCheck } from "lucide-react";
-import api from "./services/api";
+/* import api from "./services/api"; */
+import api from "./api.js";
 
 const moneyless = n => Number(n || 0).toLocaleString();
 function Login({onLogin}) {
