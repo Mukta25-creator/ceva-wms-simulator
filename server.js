@@ -197,5 +197,15 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ message: "Internal server error" });
 });
 
+/*const port = Number(process.env.PORT || 5000);
+app.listen(port, () => console.log(`WMS API running at http://localhost:${port}`));*/
+
+
 const port = Number(process.env.PORT || 5000);
-app.listen(port, () => console.log(`WMS API running at http://localhost:${port}`));
+
+app.listen(port, "0.0.0.0", () => {
+  console.log(`WMS API running on port ${port}`);
+});
+
+
+
