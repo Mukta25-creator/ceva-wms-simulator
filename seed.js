@@ -1,5 +1,5 @@
 import bcrypt from "bcryptjs";
-import db from "./config/database.js";
+import db from "./database.js";
 
 const seed = db.transaction(() => {
   const count = db.prepare("SELECT COUNT(*) AS n FROM users").get().n;
