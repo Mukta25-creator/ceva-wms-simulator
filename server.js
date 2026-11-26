@@ -678,16 +678,16 @@ app.post("/api/orders/:id/release", asyncRoute((req, res) => {
           WHERE id = ?
         `).run(allocateQty, inventory.id);
 
-   
-const allocationResult = db.prepare(`
+
+        const allocationResult = db.prepare(`
   INSERT INTO allocations
     (order_line_id, inventory_id, allocated_qty, picked_qty, status)
   VALUES (?, ?, ?, 0, 'ALLOCATED')
 `).run(
-  line.order_line_id,
-  inventory.id,
-  allocateQty
-);
+          line.order_line_id,
+          inventory.id,
+          allocateQty
+        );
 
 
         db.prepare(`
@@ -1488,10 +1488,10 @@ app.post(
       );
     }
 
-    
-const completeTransaction = db.transaction(() => {
-  // Decrease physical stock and reserved stock together.
-  const inventoryResult = db.prepare(`
+
+    const completeTransaction = db.transaction(() => {
+      // Decrease physical stock and reserved stock together.
+      const inventoryResult = db.prepare(`
     UPDATE inventory
     SET
       quantity = quantity - ?,
@@ -1501,22 +1501,22 @@ const completeTransaction = db.transaction(() => {
       AND quantity >= ?
       AND allocated_qty >= ?
   `).run(
-    pickedQty,
-    pickedQty,
-    task.inventory_id,
-    pickedQty,
-    pickedQty
-  );
+        pickedQty,
+        pickedQty,
+        task.inventory_id,
+        pickedQty,
+        pickedQty
+      );
 
-  if (inventoryResult.changes !== 1) {
-    throw httpError(
-      "Inventory changed during picking. Refresh and retry",
-      409
-    );
-  }
+      if (inventoryResult.changes !== 1) {
+        throw httpError(
+          "Inventory changed during picking. Refresh and retry",
+          409
+        );
+      }
 
-  // Record the completed allocation.
-  const allocationResult = db.prepare(`
+      // Record the completed allocation.
+      const allocationResult = db.prepare(`
     UPDATE allocations
     SET picked_qty = ?, status = 'PICKED'
     WHERE id = ?
@@ -1524,72 +1524,72 @@ const completeTransaction = db.transaction(() => {
       AND picked_qty = 0
   `).run(pickedQty, task.allocation_id);
 
-  if (allocationResult.changes !== 1) {
-    throw httpError(
-      "Allocation is no longer available for picking",
-      409
-    );
-  }
+      if (allocationResult.changes !== 1) {
+        throw httpError(
+          "Allocation is no longer available for picking",
+          409
+        );
+      }
 
-  // Mark the picking task completed.
-  const taskResult = db.prepare(`
+      // Mark the picking task completed.
+      const taskResult = db.prepare(`
     UPDATE pick_tasks
     SET picked_qty = ?, status = 'COMPLETED'
     WHERE id = ? AND status = 'ASSIGNED'
   `).run(pickedQty, taskId);
 
-  if (taskResult.changes !== 1) {
-    throw httpError(
-      "Picking task status changed. Refresh and retry",
-      409
-    );
-  }
+      if (taskResult.changes !== 1) {
+        throw httpError(
+          "Picking task status changed. Refresh and retry",
+          409
+        );
+      }
 
-  // Record the inventory movement.
-  db.prepare(`
+      // Record the inventory movement.
+      db.prepare(`
     INSERT INTO inventory_transactions
       (inventory_id, transaction_type, quantity_change, reference, performed_by)
     VALUES (?, ?, ?, ?, ?)
   `).run(
-    task.inventory_id,
-    "PICK",
-    -pickedQty,
-    `PICK-TASK-${taskId}`,
-    req.user.id
-  );
+        task.inventory_id,
+        "PICK",
+        -pickedQty,
+        `PICK-TASK-${taskId}`,
+        req.user.id
+      );
 
-  // Update wave status when every task is complete.
-  const remainingTasks = db.prepare(`
+      // Update wave status when every task is complete.
+      const remainingTasks = db.prepare(`
     SELECT COUNT(*) AS count
     FROM pick_tasks
     WHERE wave_id = ? AND status != 'COMPLETED'
   `).get(task.wave_id).count;
 
-  if (remainingTasks === 0) {
-    db.prepare(`
+      if (remainingTasks === 0) {
+        db.prepare(`
       UPDATE waves
       SET status = 'COMPLETED'
       WHERE id = ?
     `).run(task.wave_id);
-  }
+      }
 
-  // Record picking activity.
-  db.prepare(`
+      // Record picking activity.
+      db.prepare(`
     INSERT INTO activity_logs
       (user_id, module, action, reference, details)
     VALUES (?, ?, ?, ?, ?)
   `).run(
-    req.user.id,
-    "PICKING",
-    "TASK_COMPLETED",
-    `PICK-TASK-${taskId}`,
-    `Picked ${pickedQty} units of ${task.sku_code} from ${task.location_code}`
-  );
+        req.user.id,
+        "PICKING",
+        "TASK_COMPLETED",
+        `PICK-TASK-${taskId}`,
+        `Picked ${pickedQty} units of ${task.sku_code} from ${task.location_code}`
+      );
 
-  return {
-    remainingTasks
-  };
-});
+      return {
+        remainingTasks
+      };
+    });
 
     const result = completeTransaction();
 
@@ -1651,8 +1651,8 @@ app.get("/api/picking/waves/:id/progress", (req, res) => {
 
   const percentage = progress.total_tasks > 0
     ? Math.round(
-        (progress.completed_tasks / progress.total_tasks) * 100
-      )
+      (progress.completed_tasks / progress.total_tasks) * 100
+    )
     : 0;
 
   res.json({
