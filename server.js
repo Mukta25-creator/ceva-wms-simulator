@@ -537,8 +537,8 @@ app.post("/api/orders", (req, res) => {
     const orderId = result.lastInsertRowid;
 
     const insertLine = db.prepare(`
-      INSERT INTO order_lines (order_id,sku_id,quantity)
-      VALUES (?,?,?)
+      INSERT INTO order_lines (order_id,sku_id,ordered_qty)
+VALUES (?,?,?)
     `);
 
     for (const line of lines) {
@@ -626,7 +626,7 @@ app.post("/api/orders/:id/release", asyncRoute((req, res) => {
     SELECT
       ol.id AS order_line_id,
       ol.sku_id,
-      ol.quantity,
+      ol.ordered_qty AS quantity,
       s.code AS sku_code
     FROM order_lines ol
     JOIN skus s ON s.id = ol.sku_id
@@ -678,15 +678,17 @@ app.post("/api/orders/:id/release", asyncRoute((req, res) => {
           WHERE id = ?
         `).run(allocateQty, inventory.id);
 
-        const allocationResult = db.prepare(`
-          INSERT INTO allocations
-            (order_line_id, inventory_id, allocated_qty, picked_qty, status)
-          VALUES (?, ?, ?, 0, 'ALLOCATED')
-        `).run(
-          line.order_line_id,
-          inventory.id,
-          allocateQty
-        );
+   
+const allocationResult = db.prepare(`
+  INSERT INTO allocations
+    (order_line_id, inventory_id, allocated_qty, picked_qty, status)
+  VALUES (?, ?, ?, 0, 'ALLOCATED')
+`).run(
+  line.order_line_id,
+  inventory.id,
+  allocateQty
+);
+
 
         db.prepare(`
           INSERT INTO inventory_transactions
@@ -1208,6 +1210,459 @@ app.post("/api/waves/:id/generate-picks", asyncRoute((req, res) => {
     pick_tasks: tasks
   });
 }));
+
+
+// ======================================================
+// PHASE 3: PICKING EXECUTION
+// ======================================================
+
+// ---------- Shared picking task query ----------
+
+const getPickingTask = (taskId) => db.prepare(`
+  SELECT
+    pt.id AS pick_task_id,
+    pt.wave_id,
+    pt.allocation_id,
+    pt.status,
+    pt.picked_qty,
+    pt.assigned_to,
+    a.allocated_qty,
+    a.picked_qty AS allocation_picked_qty,
+    a.status AS allocation_status,
+    ol.id AS order_line_id,
+    ol.ordered_qty,
+    o.id AS order_id,
+    o.order_number,
+    s.id AS sku_id,
+    s.code AS sku_code,
+    s.description AS sku_description,
+    i.id AS inventory_id,
+    i.quantity AS inventory_quantity,
+    i.allocated_qty AS inventory_allocated_qty,
+    l.id AS location_id,
+    l.code AS location_code,
+    u.name AS assigned_operator
+  FROM pick_tasks pt
+  JOIN allocations a ON a.id = pt.allocation_id
+  JOIN order_lines ol ON ol.id = a.order_line_id
+  JOIN orders o ON o.id = ol.order_id
+  JOIN skus s ON s.id = ol.sku_id
+  JOIN inventory i ON i.id = a.inventory_id
+  JOIN locations l ON l.id = i.location_id
+  LEFT JOIN users u ON u.id = pt.assigned_to
+  WHERE pt.id = ?
+`).get(taskId);
+
+
+// ---------- GET: List Picking Tasks ----------
+
+app.get("/api/picking/tasks", (req, res) => {
+  const conditions = [];
+  const params = [];
+
+  if (req.query.status) {
+    conditions.push("pt.status = ?");
+    params.push(clean(req.query.status).toUpperCase());
+  }
+
+  if (req.query.wave_id) {
+    if (!positiveInt(req.query.wave_id)) {
+      return res.status(400).json({
+        message: "Invalid wave_id"
+      });
+    }
+
+    conditions.push("pt.wave_id = ?");
+    params.push(Number(req.query.wave_id));
+  }
+
+  const whereClause = conditions.length
+    ? `WHERE ${conditions.join(" AND ")}`
+    : "";
+
+  const tasks = db.prepare(`
+    SELECT
+      pt.id AS pick_task_id,
+      pt.wave_id,
+      pt.allocation_id,
+      pt.status,
+      pt.picked_qty,
+      pt.assigned_to,
+      a.allocated_qty,
+      o.order_number,
+      s.code AS sku_code,
+      s.description AS sku_description,
+      l.code AS location_code,
+      u.name AS assigned_operator,
+      pt.created_at
+    FROM pick_tasks pt
+    JOIN allocations a ON a.id = pt.allocation_id
+    JOIN order_lines ol ON ol.id = a.order_line_id
+    JOIN orders o ON o.id = ol.order_id
+    JOIN skus s ON s.id = ol.sku_id
+    JOIN inventory i ON i.id = a.inventory_id
+    JOIN locations l ON l.id = i.location_id
+    LEFT JOIN users u ON u.id = pt.assigned_to
+    ${whereClause}
+    ORDER BY pt.id
+  `).all(...params);
+
+  res.json({
+    count: tasks.length,
+    tasks
+  });
+});
+
+
+// ---------- GET: Single Picking Task ----------
+
+app.get("/api/picking/tasks/:id", (req, res) => {
+  if (!positiveInt(req.params.id)) {
+    return res.status(400).json({
+      message: "Invalid picking task ID"
+    });
+  }
+
+  const task = getPickingTask(Number(req.params.id));
+
+  if (!task) {
+    return res.status(404).json({
+      message: "Picking task not found"
+    });
+  }
+
+  res.json(task);
+});
+
+
+// ---------- PUT: Assign Picking Task ----------
+
+app.put(
+  "/api/picking/tasks/:id/assign",
+  asyncRoute((req, res) => {
+    const taskId = Number(req.params.id);
+    const assignedTo = Number(req.body.assigned_to);
+
+    if (!positiveInt(taskId)) {
+      throw httpError("Invalid picking task ID");
+    }
+
+    if (!positiveInt(assignedTo)) {
+      throw httpError("A valid assigned_to user ID is required");
+    }
+
+    const task = getPickingTask(taskId);
+
+    if (!task) {
+      throw httpError("Picking task not found", 404);
+    }
+
+    if (task.status === "COMPLETED") {
+      throw httpError("Completed tasks cannot be reassigned", 409);
+    }
+
+    const operator = db.prepare(`
+      SELECT id, name, email, role, active
+      FROM users
+      WHERE id = ? AND active = 1
+    `).get(assignedTo);
+
+    if (!operator) {
+      throw httpError("Active operator not found", 404);
+    }
+
+    if (!["OPERATOR", "SUPERVISOR", "ADMIN"].includes(operator.role)) {
+      throw httpError(
+        "Selected user does not have an eligible warehouse role"
+      );
+    }
+
+    const assignTransaction = db.transaction(() => {
+      db.prepare(`
+        UPDATE pick_tasks
+        SET assigned_to = ?, status = 'ASSIGNED'
+        WHERE id = ?
+      `).run(assignedTo, taskId);
+
+      db.prepare(`
+        INSERT INTO activity_logs
+          (user_id, module, action, reference, details)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(
+        req.user.id,
+        "PICKING",
+        "TASK_ASSIGNED",
+        `PICK-TASK-${taskId}`,
+        `Assigned to ${operator.name} (user ID ${assignedTo})`
+      );
+    });
+
+    assignTransaction();
+
+    res.json({
+      message: "Picking task assigned successfully",
+      pick_task_id: taskId,
+      assigned_to: operator.id,
+      assigned_operator: operator.name,
+      status: "ASSIGNED"
+    });
+  })
+);
+
+
+// ---------- POST: Complete Picking Task ----------
+
+app.post(
+  "/api/picking/tasks/:id/complete",
+  asyncRoute((req, res) => {
+    const taskId = Number(req.params.id);
+    const pickedQty = Number(req.body.picked_qty);
+    const locationCode = clean(req.body.location_code).toUpperCase();
+
+    if (!positiveInt(taskId)) {
+      throw httpError("Invalid picking task ID");
+    }
+
+    if (!Number.isInteger(pickedQty) || pickedQty <= 0) {
+      throw httpError("picked_qty must be a positive integer");
+    }
+
+    if (!locationCode) {
+      throw httpError("location_code is required");
+    }
+
+    const task = getPickingTask(taskId);
+
+    if (!task) {
+      throw httpError("Picking task not found", 404);
+    }
+
+    if (task.status === "COMPLETED") {
+      throw httpError("Picking task is already completed", 409);
+    }
+
+    if (task.status !== "ASSIGNED") {
+      throw httpError("Assign the picking task before completing it", 409);
+    }
+
+    if (
+      Number(task.assigned_to) !== Number(req.user.id) &&
+      !["ADMIN", "SUPERVISOR"].includes(req.user.role)
+    ) {
+      throw httpError(
+        "This picking task is assigned to another operator",
+        403
+      );
+    }
+
+    if (locationCode !== task.location_code.toUpperCase()) {
+      throw httpError(
+        `Incorrect picking location. Expected ${task.location_code}`,
+        400
+      );
+    }
+
+    if (pickedQty !== task.allocated_qty) {
+      throw httpError(
+        `Picked quantity must equal allocated quantity (${task.allocated_qty})`
+      );
+    }
+
+    if (
+      task.allocation_status !== "ALLOCATED" ||
+      task.allocation_picked_qty !== 0
+    ) {
+      throw httpError(
+        "Allocation is not available for picking",
+        409
+      );
+    }
+
+    if (
+      task.inventory_quantity < pickedQty ||
+      task.inventory_allocated_qty < pickedQty
+    ) {
+      throw httpError(
+        "Insufficient physical or allocated inventory",
+        409
+      );
+    }
+
+    
+const completeTransaction = db.transaction(() => {
+  // Decrease physical stock and reserved stock together.
+  const inventoryResult = db.prepare(`
+    UPDATE inventory
+    SET
+      quantity = quantity - ?,
+      allocated_qty = allocated_qty - ?,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+      AND quantity >= ?
+      AND allocated_qty >= ?
+  `).run(
+    pickedQty,
+    pickedQty,
+    task.inventory_id,
+    pickedQty,
+    pickedQty
+  );
+
+  if (inventoryResult.changes !== 1) {
+    throw httpError(
+      "Inventory changed during picking. Refresh and retry",
+      409
+    );
+  }
+
+  // Record the completed allocation.
+  const allocationResult = db.prepare(`
+    UPDATE allocations
+    SET picked_qty = ?, status = 'PICKED'
+    WHERE id = ?
+      AND status = 'ALLOCATED'
+      AND picked_qty = 0
+  `).run(pickedQty, task.allocation_id);
+
+  if (allocationResult.changes !== 1) {
+    throw httpError(
+      "Allocation is no longer available for picking",
+      409
+    );
+  }
+
+  // Mark the picking task completed.
+  const taskResult = db.prepare(`
+    UPDATE pick_tasks
+    SET picked_qty = ?, status = 'COMPLETED'
+    WHERE id = ? AND status = 'ASSIGNED'
+  `).run(pickedQty, taskId);
+
+  if (taskResult.changes !== 1) {
+    throw httpError(
+      "Picking task status changed. Refresh and retry",
+      409
+    );
+  }
+
+  // Record the inventory movement.
+  db.prepare(`
+    INSERT INTO inventory_transactions
+      (inventory_id, transaction_type, quantity_change, reference, performed_by)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(
+    task.inventory_id,
+    "PICK",
+    -pickedQty,
+    `PICK-TASK-${taskId}`,
+    req.user.id
+  );
+
+  // Update wave status when every task is complete.
+  const remainingTasks = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM pick_tasks
+    WHERE wave_id = ? AND status != 'COMPLETED'
+  `).get(task.wave_id).count;
+
+  if (remainingTasks === 0) {
+    db.prepare(`
+      UPDATE waves
+      SET status = 'COMPLETED'
+      WHERE id = ?
+    `).run(task.wave_id);
+  }
+
+  // Record picking activity.
+  db.prepare(`
+    INSERT INTO activity_logs
+      (user_id, module, action, reference, details)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(
+    req.user.id,
+    "PICKING",
+    "TASK_COMPLETED",
+    `PICK-TASK-${taskId}`,
+    `Picked ${pickedQty} units of ${task.sku_code} from ${task.location_code}`
+  );
+
+  return {
+    remainingTasks
+  };
+});
+
+    const result = completeTransaction();
+
+    res.json({
+      message: "Picking task completed successfully",
+      pick_task_id: taskId,
+      wave_id: task.wave_id,
+      order_number: task.order_number,
+      sku_code: task.sku_code,
+      location_code: task.location_code,
+      picked_qty: pickedQty,
+      status: "COMPLETED",
+      remaining_tasks: result.remainingTasks,
+      wave_status:
+        result.remainingTasks === 0 ? "COMPLETED" : "PICKING"
+    });
+  })
+);
+
+
+// ---------- GET: Wave Picking Progress ----------
+
+app.get("/api/picking/waves/:id/progress", (req, res) => {
+  const waveId = Number(req.params.id);
+
+  if (!positiveInt(waveId)) {
+    return res.status(400).json({
+      message: "Invalid wave ID"
+    });
+  }
+
+  const wave = db.prepare(`
+    SELECT
+      w.id,
+      w.wave_number,
+      w.warehouse_id,
+      w.status,
+      w.created_at
+    FROM waves w
+    WHERE w.id = ?
+  `).get(waveId);
+
+  if (!wave) {
+    return res.status(404).json({
+      message: "Wave not found"
+    });
+  }
+
+  const progress = db.prepare(`
+    SELECT
+      COUNT(*) AS total_tasks,
+      SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END) AS pending_tasks,
+      SUM(CASE WHEN status = 'ASSIGNED' THEN 1 ELSE 0 END) AS assigned_tasks,
+      SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) AS completed_tasks,
+      COALESCE(SUM(picked_qty), 0) AS total_picked_units
+    FROM pick_tasks
+    WHERE wave_id = ?
+  `).get(waveId);
+
+  const percentage = progress.total_tasks > 0
+    ? Math.round(
+        (progress.completed_tasks / progress.total_tasks) * 100
+      )
+    : 0;
+
+  res.json({
+    wave,
+    progress: {
+      ...progress,
+      completion_percentage: percentage
+    }
+  });
+});
 
 
 // ======================================================
